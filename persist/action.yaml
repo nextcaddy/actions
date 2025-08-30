@@ -14,7 +14,7 @@ inputs:
   scope:
     description: "Optional scope: '', 'branch', or 'run' (adds a folder level)"
     required: false
-    default: ""
+    default: "run"
   verbose:
     description: "Emit detailed logs (sizes, counts, listings, rsync stats)"
     required: true
