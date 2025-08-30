@@ -142,7 +142,7 @@ Place the action at `./.gitea/actions/persist/action.yml` (or `./.github/actions
 | `mode`   | ✅       | —        | `save` or `restore`. |
 | `files`  | ✅       | —        | Multiline list of workspace‑relative paths or globs. Comments (`# …`) and blank lines allowed. |
 | `store`  | ❌       | `/store` | Absolute path mounted inside the job container. |
-| `scope`  | ❌       | `""`     | `""` (none), `branch`, or `run`. |
+| `scope`  | ❌       | `"run"`     | `"global"`, `branch`, or `run`. |
 | `verbose`| ✅       | `"false"`| Rich logs: sizes, counts, ls listings, rsync stats. |
 | `trace`  | ❌       | `"false"`| Enable shell tracing (`set -x`). |
 | `dry-run`| ❌       | `"false"`| Simulate saves/restores without changing files. |
