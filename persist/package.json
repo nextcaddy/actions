@@ -1,0 +1,31 @@
+{
+  "name": "@slope/actions-persist",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Save/restore files to a host-mounted store with run-scope post cleanup.",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "run-s clean && run-p build:*",
+    "build:index": "npx ncc build src/index.ts -o dist/index --minify",
+    "build:pre": "npx ncc build src/pre.ts   -o dist/pre   --minify",
+    "build:post": "npx ncc build src/post.ts  -o dist/post  --minify",
+    "postbuild": "mv dist/index/index.js dist/index.js && mv dist/pre/index.js dist/pre.js && mv dist/post/index.js dist/post.js && rm -rf dist/{post,index,pre}"
+  },
+  "dependencies": {
+    "@actions/core": "^1.11.1",
+    "fast-glob": "^3.3.2",
+    "fs-extra": "^11.2.0",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/fs-extra": "^11.0.4",
+    "@types/node": "^24.3.0",
+    "@vercel/ncc": "^0.38.3",
+    "npm-run-all": "^4.1.5",
+    "typescript": "^5.5.4"
+  },
+  "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"
+}

@@ -1,0 +1,45 @@
+name: "Persist (save/restore) files to host store"
+description: "Save/restore selected files to a persistent host store by project, preserving structure"
+
+inputs:
+  mode:
+    description: "save | restore | cleanup"
+    required: true
+  files:
+    description: "Multiline list of files/dirs or globs (workspace-relative). Comments (# ...) and blank lines allowed."
+    required: false
+    default: ""
+  store:
+    description: "Absolute host path bind-mounted in jobs (e.g. /store)"
+    required: false
+    default: "/store"
+  scope:
+    description: "Scope: 'global', 'branch', or 'run' (adds a folder level)"
+    required: false
+    default: "branch"
+  link:
+    description: "When restoring: 'soft' (symlink) or 'hard' (hardlink, copy fallback across devices)"
+    required: false
+    default: "soft"
+  verbose:
+    description: "Emit detailed logs (sizes, counts, listings, stats)"
+    required: false
+    default: "false"
+  trace:
+    description: "Extra debug logging"
+    required: false
+    default: "false"
+  dry-run:
+    description: "Don't write, just report what would happen"
+    required: false
+    default: "false"
+
+outputs:
+  dest_root:
+    description: "Resolved root destination in the store"
+
+runs:
+  using: "node20"
+  pre: "dist/pre.js"
+  main: "dist/index.js"
+  post: "dist/post.js"
