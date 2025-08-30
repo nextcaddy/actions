@@ -1,0 +1,184 @@
+name: "Persist (save/restore) files to host store"
+description: "Save/restore selected files to a persistent host store by project, preserving structure"
+inputs:
+  mode:
+    description: "save | restore"
+    required: true
+  files:
+    description: "Multiline list of files/dirs or globs (workspace-relative). Comments (# ...) and blank lines allowed."
+    required: true
+  store:
+    description: "Absolute host path bind-mounted in jobs (e.g. /store)"
+    required: false
+    default: "/store"
+  scope:
+    description: "Optional scope: '', 'branch', or 'run' (adds a folder level)"
+    required: false
+    default: ""
+  verbose:
+    description: "Emit detailed logs (sizes, counts, listings, rsync stats)"
+    required: true
+    default: "false"
+  trace:
+    description: "Enable shell tracing (set -x)"
+    required: false
+    default: "false"
+  dry-run:
+    description: "Don't write, just report what would happen"
+    required: false
+    default: "false"
+
+outputs:
+  dest_root:
+    description: "Resolved root destination in the store"
+    value: ${{ steps.run.outputs.dest_root }}
+
+runs:
+  using: "composite"
+  steps:
+    - id: run
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        MODE="${{ inputs.mode }}"
+        STORE="${{ inputs.store }}"
+        SCOPE="${{ inputs.scope }}"
+        VERBOSE="${{ inputs.verbose }}"
+        TRACE="${{ inputs.trace }}"
+        DRY_RUN="${{ inputs['dry-run'] }}"
+        FILES_RAW="${{ inputs.files }}"
+
+        if [ "$TRACE" = "true" ]; then set -x; fi
+
+        begin(){ echo "::group::$*"; }
+        end(){ echo "::endgroup::"; }
+
+        # ensure store is mounted
+        [ -d "$STORE" ] || { echo "::error::Store not mounted: $STORE"; exit 1; }
+
+        # repo name: org/repo -> org__repo
+        REPO_SAFE="${GITHUB_REPOSITORY//\//__}"
+        case "$SCOPE" in
+          "" )      SCOPE_PART="";;
+          branch )  SCOPE_PART="/${GITHUB_REF_NAME}";;
+          run )     SCOPE_PART="/run-${GITHUB_RUN_ID}";;
+          * )       echo "::error::Unknown scope '${SCOPE}' (use '', 'branch', or 'run')"; exit 2;;
+        esac
+        DEST_ROOT="${STORE}/${REPO_SAFE}${SCOPE_PART}"
+        echo "dest_root=$DEST_ROOT" >> "$GITHUB_OUTPUT"
+
+        # parse file list (strip comments & blank lines)
+        mapfile -t PATTERNS < <(printf '%s\n' "$FILES_RAW" | sed -E 's/#.*$//' | awk 'NF')
+        if [ "${#PATTERNS[@]}" -eq 0 ]; then
+          echo "::error::No files specified"; exit 2
+        fi
+
+        # glob behavior
+        shopt -s nullglob dotglob globstar
+
+        list_dir () {
+          local p="$1"
+          if [ "$VERBOSE" = "true" ]; then
+            if [ -d "$p" ]; then
+              echo "path: $p"
+              du -sh "$p" 2>/dev/null || true
+              echo "files: $(find "$p" -type f | wc -l | tr -d ' ')"
+              echo "dirs:  $(find "$p" -type d | wc -l | tr -d ' ')"
+              ls -la "$p" | sed -n '1,100p' || true
+            else
+              echo "path: $p (missing)"
+            fi
+          fi
+        }
+
+        begin "persist: context"
+        echo "mode=$MODE  repo=$REPO_SAFE  scope=${SCOPE:-<none>}"
+        echo "store=$STORE"
+        echo "dest_root=$DEST_ROOT"
+        echo "workspace=${GITHUB_WORKSPACE:-$PWD}"
+        if [ "$VERBOSE" = "true" ]; then df -h "$STORE" || true; fi
+        end
+
+        case "$MODE" in
+          save)
+            begin "persist: resolve & copy"
+            SAVED=()
+            for pat in "${PATTERNS[@]}"; do
+              case "$pat" in /*|*'..'* ) echo "::error::Invalid pattern (absolute or '..'): $pat"; exit 2;; esac
+              matches=( $pat )
+              if [ ${#matches[@]} -eq 0 ]; then
+                echo "::warning::No matches for pattern: $pat"
+                continue
+              fi
+              for m in "${matches[@]}"; do
+                dst="$DEST_ROOT/$m"
+                if [ -d "$m" ]; then
+                  mkdir -p "$dst"
+                  if command -v rsync >/dev/null 2>&1; then
+                    RSYNC_FLAGS=(-a --delete)
+                    [ "$VERBOSE" = "true" ] && RSYNC_FLAGS+=(--stats --info=flist2,progress2)
+                    [ "$DRY_RUN" = "true" ] && RSYNC_FLAGS+=(-n)
+                    echo "rsync ${RSYNC_FLAGS[*]} $m/. -> $dst/"
+                    rsync "${RSYNC_FLAGS[@]}" "$m/." "$dst/"
+                  else
+                    if [ "$DRY_RUN" = "true" ]; then
+                      echo "(dry-run) would wipe '$dst' and cp -a '$m/.' -> '$dst/'"
+                    else
+                      find "$dst" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+                      cp -a "$m/." "$dst/"
+                    fi
+                  fi
+                else
+                  mkdir -p "$(dirname "$dst")"
+                  if [ "$DRY_RUN" = "true" ]; then
+                    echo "(dry-run) would cp -a '$m' -> '$dst'"
+                  else
+                    cp -a "$m" "$dst"
+                  fi
+                fi
+                SAVED+=("$m -> $dst")
+                [ "$VERBOSE" = "true" ] && list_dir "$dst"
+              done
+            done
+            if [ "$VERBOSE" = "true" ]; then
+              echo "saved items:"
+              for s in "${SAVED[@]}"; do echo " - $s"; done
+            fi
+            end
+            ;;
+
+          restore)
+            begin "persist: link"
+            RESTORED=()
+            for pat in "${PATTERNS[@]}"; do
+              store_matches=( "$DEST_ROOT"/$pat )
+              if [ ${#store_matches[@]} -eq 0 ]; then
+                echo "::warning::Nothing saved for pattern at $DEST_ROOT: $pat"
+                continue
+              fi
+              for sm in "${store_matches[@]}"; do
+                rel="${sm#$DEST_ROOT/}"
+                case "$rel" in /*|*'..'* ) echo "::error::Invalid stored rel path: $rel"; exit 2;; esac
+                mkdir -p "$(dirname "$rel")"
+                if [ "$DRY_RUN" = "true" ]; then
+                  echo "(dry-run) would symlink '$rel' -> '$sm'"
+                else
+                  [ -e "$rel" ] || [ -L "$rel" ] && rm -rf "$rel"
+                  ln -sfn "$sm" "$rel"
+                  echo "link: $rel -> $(readlink "$rel" || true)"
+                  [ "$VERBOSE" = "true" ] && list_dir "$rel"
+                fi
+                RESTORED+=("$rel -> $sm")
+              done
+            done
+            if [ "$VERBOSE" = "true" ]; then
+              echo "restored links:"
+              for r in "${RESTORED[@]}"; do echo " - $r"; done
+            fi
+            end
+            ;;
+
+          *)
+            echo "::error::Unknown mode: $MODE"; exit 2;;
+        esac
