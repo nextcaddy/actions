@@ -1,10 +1,11 @@
-# Buildx per-arch push + OCI manifest
+# Buildx per-arch push + OCI manifest (matrix-friendly)
 
-Build and push **per-architecture Docker images** with Buildx and (optionally) create a **multi-arch OCI manifest** — all in one composite action.
+Build and push **per-architecture Docker images** with Buildx and (optionally) create a **multi-arch OCI manifest** — all in one composite action. Designed to play nicely with **matrix builds**.
 
 - Minimal interface: `image` is just the **bare name** (e.g., `slope-graphql`).
 - Visibility routing: publish to `private/<image>`, `library/<image>`, or **both**.
 - Flexible tagging: always `:<sha>`; plus whatever you pass via `tag:` (no automatic git-ref tagging).
+- Matrix-ready: set `build: "false"` to **skip building** and only **assemble a manifest** from tags pushed by matrix jobs.
 - Logging controls: `verbose`, `trace`.
 - Sensible defaults: `arches: amd64 arm64`, `dockerfile: Dockerfile`, `manifest: true`.
 
@@ -20,7 +21,7 @@ Build and push **per-architecture Docker images** with Buildx and (optionally) c
 2. **Creates a multi-arch manifest** (unless `manifest: "false"`):
    - For each target visibility (`private`, `public`, or `both`):
      - Tags: `:<sha>` and any **additional tags** from the `tag` input.
-   - Sources are the per-arch tags built in step 1.
+   - Sources are the per-arch tags built in step 1 (or pre-pushed by matrix jobs when `build: "false"`).
 
 > The action **does not** infer tags from `GITHUB_REF`. If you want `latest`, `v0.0.1`, etc., pass them explicitly via `tag:`.
 
@@ -59,9 +60,10 @@ Build and push **per-architecture Docker images** with Buildx and (optionally) c
 | `arches`    | ❌       | `amd64 arm64`     | Space-separated architectures to build. |
 | `build_args`| ❌       | `""`              | Multiline `KEY=VALUE`. `{arch}` placeholder expands to current arch. |
 | `options`   | ❌       | `""`              | Extra raw options appended to `docker buildx build` (e.g. `--pull --no-cache`). |
-| `push`      | ❌       | `true`            | Push per-arch images. If `false`, manifest is skipped. |
+| `push`      | ❌       | `true`            | Push per-arch images. If `false`, manifest is skipped (unless you set `build: "false"` and are only assembling from existing tags). |
 | `manifest`  | ❌       | `true`            | Create multi-arch OCI manifest from the per-arch images. |
 | `tag`       | ❌       | `latest`          | Space/newline-separated tags to apply to the manifest(s), in addition to `:<sha>`. Set empty (`""`) for only `:<sha>`. |
+| `build`     | ❌       | `true`            | **Matrix helper**. When `false`, the action **does not build** and only creates a manifest from pre-pushed per-arch tags (`:<sha>-<arch>`). |
 | `verbose`   | ❌       | `false`           | Emit grouped, detailed logs. |
 | `trace`     | ❌       | `false`           | Enable shell tracing (`set -x`). |
 
@@ -69,13 +71,13 @@ Build and push **per-architecture Docker images** with Buildx and (optionally) c
 
 | Name         | Description |
 |--------------|-------------|
-| `built_tags` | Newline-separated list of the per-arch tags that were built and (optionally) pushed. |
+| `built_tags` | Newline-separated list of the per-arch tags that were built or inferred (manifest-only mode). |
 
 ---
 
 ## 🧭 Tagging behavior
 
-- Always tags the manifest(s) with `:<sha>`.
+- Always tags the manifest(s) with `:<sha>` where `<sha>` comes from `GITHUB_SHA` / `CI_SHA1` (fallback to `git rev-parse HEAD`).
 - Additionally tags **each** visibility target with any values provided in `tag:`:  
   e.g. `latest`, `stable`, `v0.0.1`.
 - **No automatic** tag from `GITHUB_REF` — you control all extra tags.
@@ -103,7 +105,7 @@ harbor.slope.es/library/slope-graphql:v0.0.1
 
 ## 🚀 Usage
 
-### Basic (private only, default tags)
+### 1) Basic (private only, default tags)
 ```yaml
 - uses: docker/setup-buildx-action@v3
 - uses: docker/login-action@v3
@@ -123,7 +125,7 @@ harbor.slope.es/library/slope-graphql:v0.0.1
     verbose: "true"
 ```
 
-### Public & private (both), multiple tags
+### 2) Public & private (both), multiple tags
 ```yaml
 - uses: slope/actions/buildx-arch-push@v1
   with:
@@ -138,7 +140,7 @@ harbor.slope.es/library/slope-graphql:v0.0.1
       v0.0.1
 ```
 
-### Only SHA (no extra tags)
+### 3) Only SHA (no extra tags)
 ```yaml
 - uses: slope/actions/buildx-arch-push@v1
   with:
@@ -147,13 +149,73 @@ harbor.slope.es/library/slope-graphql:v0.0.1
     tag: ""              # only :<sha> will be applied
 ```
 
-### Extra buildx options
+### 4) Extra buildx options (cache-from/to example)
 ```yaml
 - uses: slope/actions/buildx-arch-push@v1
   with:
     registry: ${{ env.REGISTRY_DOMAIN }}
     image: slope-graphql
-    options: --pull --no-cache
+    options: >
+      --pull
+      --cache-from=type=registry,ref=${{ env.REGISTRY_DOMAIN }}/private/slope-graphql:cache
+      --cache-to=type=registry,ref=${{ env.REGISTRY_DOMAIN }}/private/slope-graphql:cache,mode=max
+```
+
+### 5) Matrix builds (parallel per-arch + single manifest job)
+
+**A. Build & push per-arch in parallel**
+```yaml
+jobs:
+  build-per-arch:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_DOMAIN }}
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Build & push per-arch
+        uses: slope/actions/buildx-arch-push@v1
+        with:
+          registry: ${{ env.REGISTRY_DOMAIN }}
+          image: slope-graphql
+          arches: ${{ matrix.arch }}    # single arch per job
+          push: "true"
+          manifest: "false"             # manifest later
+          build: "true"                 # build in this job
+```
+
+**B. Assemble the multi-arch manifest later (single job)**
+```yaml
+  manifest:
+    needs: build-per-arch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_DOMAIN }}
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Create multi-arch manifest from matrix-built tags
+        uses: slope/actions/buildx-arch-push@v1
+        with:
+          registry: ${{ env.REGISTRY_DOMAIN }}
+          image: slope-graphql
+          arches: "amd64 arm64"         # list all arches included
+          push: "false"                 # don't rebuild/push per-arch
+          manifest: "true"              # create manifest
+          build: "false"                # manifest-only mode
+          tag: |
+            latest
+            v1.2.3
 ```
 
 ---
@@ -163,9 +225,9 @@ harbor.slope.es/library/slope-graphql:v0.0.1
 - Per-arch images are **built once** under:
   - `private/<image>` if `visibility` is `private` or `both`
   - `library/<image>` if `visibility` is `public`
-- Action constructs `docker buildx build` commands as arrays for safe quoting.
+- Safe command assembly: arrays prevent quoting issues.
 - Manifest creation uses `docker buildx imagetools create` with all requested tags and per-arch sources.
-- `built_tags` output can be reused if you want to perform additional inspection or signing.
+- `built_tags` output can be reused for inspection, signing, or SBOM steps.
 
 ---
 
