@@ -125,6 +125,12 @@ jobs:
 - Maintain a floating major: `v1` → latest `v1.x`
 - Consumers reference as: `slope/actions/<action>@v1` or pin exact versions.
 
+```
+git fetch --tags
+git tag -a "v1.2.0" -m "release v1.2.0"
+git tag -f "v1" "v1.2.0"
+git push origin "v1.2.0"
+git push -f origin "v1"
 ---
 
 ## 🤝 Contributing
