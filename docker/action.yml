@@ -1,5 +1,6 @@
 name: "Buildx per-arch push + manifest"
-description: "Build & push per-arch images with docker buildx; OCI manifest with flexible visibility and tagging"
+description: "Build & push per-arch images with docker buildx; then create a multi-arch manifest (private/public/both). Matrix-friendly."
+
 inputs:
   registry:
     description: "Registry domain (e.g. harbor.slope.es)"
@@ -20,7 +21,7 @@ inputs:
     required: false
     default: "."
   arches:
-    description: "Space-separated list of arches"
+    description: "Space-separated list of arches (e.g. 'amd64 arm64')"
     required: false
     default: "amd64 arm64"
   build_args:
@@ -36,15 +37,19 @@ inputs:
     required: false
     default: "true"
   manifest:
-    description: "Whether to create an OCI manifest from built per-arch images"
+    description: "Whether to create a multi-arch manifest from the per-arch images"
     required: false
     default: "true"
   tag:
     description: "Space- or newline-separated list of additional tags for the manifest (e.g. 'latest v0.0.1'). Set empty to disable."
     required: false
     default: "latest"
+  build:
+    description: "Build per-arch images here (true) or manifest-only (false) using previously pushed tags"
+    required: false
+    default: "true"
   verbose:
-    description: "Emit detailed logs"
+    description: "Emit grouped logs"
     required: false
     default: "false"
   trace:
@@ -54,7 +59,7 @@ inputs:
 
 outputs:
   built_tags:
-    description: "Newline-separated list of per-arch tags produced"
+    description: "Newline-separated list of per-arch tags produced (or inferred in manifest-only mode)"
     value: ${{ steps.run.outputs.built_tags }}
 
 runs:
@@ -76,6 +81,7 @@ runs:
         PUSH="${{ inputs.push }}"
         MAKE_MANIFEST="${{ inputs.manifest }}"
         TAG_RAW="${{ inputs.tag }}"
+        BUILD="${{ inputs.build }}"
         VERBOSE="${{ inputs.verbose }}"
         TRACE="${{ inputs.trace }}"
 
@@ -85,13 +91,22 @@ runs:
 
         case "$VISIBILITY" in
           private|public|both) ;;
-          *) echo "::error::Invalid visibility '$VISIBILITY' (use private|public|both)"; exit 2;;
+          *) echo "::error::Invalid visibility '$VISIBILITY' (use private|public|both)"; exit 2 ;;
         esac
 
         PRIVATE_IMAGE="private/$IMAGE_NAME"
         PUBLIC_IMAGE="library/$IMAGE_NAME"
-        PER_ARCH_IMAGE=$([ "$VISIBILITY" = "public" ] && echo "$PUBLIC_IMAGE" || echo "$PRIVATE_IMAGE")
+        # Build per-arch under private unless explicitly public; manifest can tag to both later
+        if [ "$VISIBILITY" = "public" ]; then
+          PER_ARCH_IMAGE="$PUBLIC_IMAGE"
+        else
+          PER_ARCH_IMAGE="$PRIVATE_IMAGE"
+        fi
 
+        # robust commit SHA resolution: GitHub/Gitea/fallback
+        SHA="${GITHUB_SHA:-${CI_SHA1:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}}"
+
+        # Split and sanitize options/build-args
         read -r -a OPT_ARR <<< "${OPTIONS_RAW}"
         mapfile -t EXTRA_ARGS < <(printf '%s\n' "$BUILD_ARGS_RAW" | sed -E 's/#.*$//' | awk 'NF')
 
@@ -110,53 +125,78 @@ runs:
           echo "arches=$ARCHES"
           echo "dockerfile=$DOCKERFILE"
           echo "context=$CONTEXT"
-          echo "push=$PUSH  manifest=$MAKE_MANIFEST"
+          echo "push=$PUSH  manifest=$MAKE_MANIFEST  build=$BUILD"
           echo "tags(extra)=${TAGS_EXTRA[*]:-<none>}"
+          echo "sha=$SHA"
         }
         end
 
         BUILT_TAGS=()
-        for ARCH in $ARCHES; do
-          TAG="$REGISTRY/$PER_ARCH_IMAGE:${GITHUB_SHA}-$ARCH"
-          CMD=( docker buildx build --platform "linux/$ARCH" --file "$DOCKERFILE" --tag "$TAG" )
-          for BA in "${EXTRA_ARGS[@]}"; do
-            CMD+=( --build-arg "${BA//\{arch\}/$ARCH}" )
-          done
-          [ ${#OPT_ARR[@]} -gt 0 ] && CMD+=( "${OPT_ARR[@]}" )
-          [ "$PUSH" = "true" ] && CMD+=( --output type=image,push=true )
-          CMD+=( "$CONTEXT" )
-          echo ">> ${CMD[*]}"
-          "${CMD[@]}"
-          BUILT_TAGS+=( "$TAG" )
-        done
 
+        if [ "$BUILD" = "true" ]; then
+          begin "buildx: per-arch build"
+          for ARCH in $ARCHES; do
+            TAG="$REGISTRY/$PER_ARCH_IMAGE:${SHA}-$ARCH"
+            CMD=( docker buildx build --platform "linux/$ARCH" --file "$DOCKERFILE" --tag "$TAG" )
+            # Substitute {arch} in build args
+            for BA in "${EXTRA_ARGS[@]}"; do
+              CMD+=( --build-arg "${BA//\{arch\}/$ARCH}" )
+            done
+            # Extra options
+            [ ${#OPT_ARR[@]} -gt 0 ] && CMD+=( "${OPT_ARR[@]}" )
+            # Push or not
+            if [ "$PUSH" = "true" ]; then
+              CMD+=( --output type=image,push=true )
+            fi
+            CMD+=( "$CONTEXT" )
+
+            echo ">> ${CMD[*]}"
+            "${CMD[@]}"
+            BUILT_TAGS+=( "$TAG" )
+          done
+          end
+        else
+          # Manifest-only: assume per-arch images were already pushed by matrix jobs
+          for ARCH in $ARCHES; do
+            BUILT_TAGS+=( "$REGISTRY/$PER_ARCH_IMAGE:${SHA}-$ARCH" )
+          done
+        fi
+
+        # Expose built tags
         {
           echo "built_tags<<EOF"
           printf "%s\n" "${BUILT_TAGS[@]}"
           echo "EOF"
         } >> "$GITHUB_OUTPUT"
 
-        # Manifest
+        # Manifest creation
         if [ "$MAKE_MANIFEST" != "true" ]; then
           echo "Manifest generation disabled (manifest=false)."; exit 0; fi
-        if [ "$PUSH" != "true" ]; then
+
+        if [ "$PUSH" != "true" ] && [ "$BUILD" = "true" ]; then
           echo "::warning::Per-arch images were not pushed (push=false); skipping manifest."; exit 0; fi
 
+        # Validate sources exist (inspect)
         SOURCES=()
         for t in "${BUILT_TAGS[@]}"; do
-          docker buildx imagetools inspect "$t" >/dev/null 2>&1 && SOURCES+=( "$t" ) || echo "::warning::Missing source, skip: $t"
+          if docker buildx imagetools inspect "$t" >/dev/null 2>&1; then
+            SOURCES+=( "$t" )
+          else
+            echo "::warning::Missing source, skip: $t"
+          fi
         done
         [ ${#SOURCES[@]} -gt 0 ] || { echo "::error::No per-arch sources found for manifest."; exit 1; }
 
+        # Targets to tag
         TARGET_IMAGES=()
         { [ "$VISIBILITY" = "private" ] || [ "$VISIBILITY" = "both" ]; } && TARGET_IMAGES+=( "$PRIVATE_IMAGE" )
         { [ "$VISIBILITY" = "public" ]  || [ "$VISIBILITY" = "both" ]; } && TARGET_IMAGES+=( "$PUBLIC_IMAGE" )
 
         TAGS_ARGS=()
         for NAME in "${TARGET_IMAGES[@]}"; do
-          TAGS_ARGS+=( --tag "$REGISTRY/$NAME:${GITHUB_SHA}" )
+          TAGS_ARGS+=( --tag "$REGISTRY/$NAME:${SHA}" )
           for T in "${TAGS_EXTRA[@]}"; do
-            TAGS_ARGS+=( --tag "$REGISTRY/$NAME:$T" )
+            [ -n "$T" ] && TAGS_ARGS+=( --tag "$REGISTRY/$NAME:$T" )
           done
         done
 
