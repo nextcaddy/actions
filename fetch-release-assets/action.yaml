@@ -1,0 +1,158 @@
+name: "Fetch release assets by tag"
+description: "Download Gitea release assets for a given tag into a folder"
+
+inputs:
+  token:
+    description: "Gitea token with repo read access"
+    required: true
+  tag:
+    description: "Release tag (e.g. v1.2.3). Defaults to ref_name when run on tag"
+    required: false
+  owner:
+    description: "Repo owner/org (defaults to context)"
+    required: false
+  repo:
+    description: "Repo name (defaults to context)"
+    required: false
+  api-base:
+    description: "Gitea API base URL"
+    default: "https://gitea.slope.es/api/v1"
+  dest:
+    description: "Destination directory for downloaded assets"
+    default: "assets"
+  pattern:
+    description: "Regex to filter asset names (optional)"
+    required: false
+  fail-if-empty:
+    description: "Fail if no assets found"
+    default: "true"
+
+outputs:
+  count:
+    description: "Number of assets downloaded"
+    value: ${{ steps.fetch.outputs.count }}
+  files_json:
+    description: "JSON array of absolute file paths"
+    value: ${{ steps.fetch.outputs.files_json }}
+  dest:
+    description: "Destination directory"
+    value: ${{ steps.fetch.outputs.dest }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Ensure jq (portable)
+      shell: bash
+      run: |
+        set -euo pipefail
+        if command -v jq >/dev/null 2>&1; then
+          echo "jq already present: $(command -v jq)"
+          exit 0
+        fi
+        BIN_DIR="${GITHUB_WORKSPACE}/.bin"
+        mkdir -p "$BIN_DIR"
+        ARCH="$(uname -m)"
+        case "$ARCH" in
+          x86_64|amd64)  JQ_URL="https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64" ;;
+          aarch64|arm64) JQ_URL="https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64" ;;
+          *) echo "Unsupported arch for auto-jq: $ARCH"; exit 1 ;;
+        esac
+        curl -fsSL "$JQ_URL" -o "${BIN_DIR}/jq"
+        chmod +x "${BIN_DIR}/jq"
+        echo "${BIN_DIR}" >> "$GITHUB_PATH"
+        jq --version
+
+    - name: Fetch assets
+      id: fetch
+      shell: bash
+      env:
+        API_BASE: ${{ inputs['api-base'] }}
+        TOKEN: ${{ inputs.token }}
+        TAG: ${{ inputs.tag }}
+        DEST: ${{ inputs.dest }}
+        PATTERN: ${{ inputs.pattern }}
+        FAIL_EMPTY: ${{ inputs['fail-if-empty'] }}
+        OWNER_IN: ${{ inputs.owner }}
+        REPO_IN: ${{ inputs.repo }}
+      run: |
+        set -euo pipefail
+
+        if [[ -z "${TOKEN:-}" ]]; then
+          echo "::error::'token' input is required"; exit 1
+        fi
+
+        # Owner/repo: default from context if not provided
+        OWNER="${OWNER_IN:-${GITHUB_REPOSITORY%/*}}"
+        REPO="${REPO_IN:-${GITHUB_REPOSITORY#*/}}"
+        TAG="${TAG:-${GITHUB_REF_NAME:-}}"
+        API="${API_BASE%/}"
+
+        if [[ -z "$OWNER" || -z "$REPO" || -z "$TAG" ]]; then
+          echo "::error::owner/repo/tag missing. owner='${OWNER}' repo='${REPO}' tag='${TAG}'"; exit 1
+        fi
+
+        echo "Repo: ${OWNER}/${REPO}"
+        echo "Tag:  ${TAG}"
+        echo "API:  ${API}"
+
+        mkdir -p "$DEST"
+
+        # 1) get release by tag
+        rel_json="$(curl -fsSL -H "Authorization: token ${TOKEN}" \
+          "${API}/repos/${OWNER}/${REPO}/releases/tags/${TAG}")" || {
+            echo "::error::Failed to fetch release for tag ${TAG}"; exit 1; }
+
+        rel_id="$(jq -r '.id' <<<"$rel_json")"
+        if [[ -z "$rel_id" || "$rel_id" == "null" ]]; then
+          echo "::error::Release not found for tag ${TAG}"; exit 1
+        fi
+
+        # 2) list assets
+        assets_json="$(curl -fsSL -H "Authorization: token ${TOKEN}" \
+          "${API}/repos/${OWNER}/${REPO}/releases/${rel_id}/assets")"
+
+        # optional filter by regex
+        if [[ -n "${PATTERN:-}" ]]; then
+          assets_json="$(jq --arg re "$PATTERN" '[ .[] | select(.name|test($re)) ]' <<<"$assets_json")"
+        fi
+
+        count="$(jq 'length' <<<"$assets_json")"
+        echo "Found ${count} assets after filtering"
+        if [[ "$count" -eq 0 ]]; then
+          if [[ "${FAIL_EMPTY,,}" == "true" ]]; then
+            echo "::error::No assets to download"; exit 2
+          else
+            echo "No assets to download (continuing)."
+            {
+              echo "count=0"
+              echo "files_json=[]"
+              echo "dest=${DEST}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+        fi
+
+        # 3) download assets (no subshell, robust to spaces)
+        files=()
+        while IFS= read -r row; do
+          id="$(jq -r '.id'   <<<"$row")"
+          name="$(jq -r '.name' <<<"$row")"
+          echo "Downloading: ${name}"
+          curl -fsSL \
+            -H "Authorization: token ${TOKEN}" \
+            -H "Accept: application/octet-stream" \
+            -o "${DEST}/${name}" \
+            "${API}/repos/${OWNER}/${REPO}/releases/${rel_id}/assets/${id}"
+          files+=("${DEST}/${name}")
+        done < <(jq -c '.[]' <<<"$assets_json")
+
+        # outputs
+        files_json="$(printf '%s\n' "${files[@]}" | jq -R . | jq -s -c '.')"
+        echo "Downloaded files:"
+        echo "${files_json}"
+
+        {
+          echo "count=${count}"
+          echo "files_json=${files_json}"   # compact single-line JSON
+          echo "dest=${DEST}"
+        } >> "$GITHUB_OUTPUT"
