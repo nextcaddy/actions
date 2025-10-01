@@ -97,6 +97,34 @@ runs:
 
         mkdir -p "$DEST"
 
+        # small helpers
+        req() {  # curl that prints status to stdout, writes body to file if arg2 present
+          local url="$1"; local out="${2:-}"
+          local code
+          if [[ -n "$out" ]]; then
+            code=$(curl -sS -L -w '%{http_code}' -o "$out" \
+                    -H "Authorization: token ${TOKEN}" "$url")
+          else
+            code=$(curl -sS -L -w '%{http_code}' \
+                    -H "Authorization: token ${TOKEN}" "$url")
+          fi
+          echo -n "$code"
+        }
+
+        not_binary_json_or_html() {  # returns 0 if looks like JSON/HTML; 1 otherwise
+          local f="$1"
+          local head
+          head=$(head -c 16 "$f" || true)
+          [[ "$head" =~ ^\{ || "$head" =~ ^\< || "$head" =~ ^\"?\{ ]]
+        }
+
+        looks_like_elf() {  # returns 0 if ELF magic 0x7f454c46
+          local f="$1"
+          local magic
+          magic=$(head -c 4 "$f" | od -An -t x1 | tr -d ' \n')
+          [[ "$magic" == "7f454c46" ]]
+        }
+
         # 1) get release by tag
         rel_json="$(curl -fsSL -H "Authorization: token ${TOKEN}" \
           "${API}/repos/${OWNER}/${REPO}/releases/tags/${TAG}")" || {
@@ -132,21 +160,65 @@ runs:
           fi
         fi
 
-        # 3) download assets (no subshell, robust to spaces)
         files=()
         while IFS= read -r row; do
           id="$(jq -r '.id'   <<<"$row")"
           name="$(jq -r '.name' <<<"$row")"
+          bdl="$(jq -r '.browser_download_url // empty' <<<"$row")"
+
           echo "Downloading: ${name}"
-          curl -fsSL \
-            -H "Authorization: token ${TOKEN}" \
-            -H "Accept: application/octet-stream" \
-            -o "${DEST}/${name}" \
-            "${API}/repos/${OWNER}/${REPO}/releases/${rel_id}/assets/${id}"
-          files+=("${DEST}/${name}")
+          target="${DEST}/${name}"
+          ok=0
+
+          # Prefer browser_download_url (some Gitea versions handle this best)
+          if [[ -n "$bdl" ]]; then
+            code=$(req "$bdl" "$target")
+            [[ "$code" == "200" ]] && ok=1
+
+            # If header auth not honored across redirects, try query token
+            if [[ "$ok" -eq 0 ]]; then
+              sep='?'; [[ "$bdl" == *\?* ]] && sep='&'
+              code=$(req "${bdl}${sep}access_token=${TOKEN}" "$target")
+              [[ "$code" == "200" ]] && ok=1
+            fi
+          fi
+
+          # Fallback to API endpoint with octet-stream
+          if [[ "$ok" -eq 0 ]]; then
+            code=$(curl -sS -L -w '%{http_code}' -o "$target" \
+                      -H "Authorization: token ${TOKEN}" \
+                      -H "Accept: application/octet-stream" \
+                      "${API}/repos/${OWNER}/${REPO}/releases/${rel_id}/assets/${id}")
+            [[ "$code" == "200" ]] && ok=1
+          fi
+
+          if [[ "$ok" -ne 1 ]]; then
+            echo "::error::Failed to download ${name} (HTTP ${code})"
+            exit 3
+          fi
+
+          # Guard: reject JSON/HTML error bodies early
+          if not_binary_json_or_html "$target"; then
+            echo "::error::Downloaded ${name} looks like JSON/HTML (not a binary)."
+            echo "First bytes:"; head -c 120 "$target" || true; echo
+            exit 4
+          fi
+
+          # Optional: enforce ELF for typical Linux binaries (skip if you also fetch zips)
+          case "$name" in
+            *.zip|*.tar|*.tar.gz|*.tgz) : ;; # archives allowed
+            *)
+              if ! looks_like_elf "$target"; then
+                echo "::warning::${name} does not look like an ELF binary. File says:"
+                file "$target" || true
+              fi
+              ;;
+          esac
+
+          chmod +x "$target" || true
+          files+=("$target")
         done < <(jq -c '.[]' <<<"$assets_json")
 
-        # outputs
         files_json="$(printf '%s\n' "${files[@]}" | jq -R . | jq -s -c '.')"
         echo "Downloaded files:"
         echo "${files_json}"
